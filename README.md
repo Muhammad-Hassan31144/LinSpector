@@ -72,7 +72,7 @@ See [INCLUSIVE_USAGE.md](INCLUSIVE_USAGE.md) for detailed examples and best prac
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/Linspector.git
+git clone https://github.com/Muhammad-Hassan31144/Linspector.git
 cd Linspector
 
 # Make executable
