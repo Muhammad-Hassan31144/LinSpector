@@ -45,6 +45,26 @@
 | ⚡ **Fast Mode** | Skip delays for quick scans (`-f`) |
 | 🔍 **Keyword Search** | Search configs/logs for sensitive data (`-k`) |
 | 🐳 **Container Aware** | Detects Docker/LXC environments |
+| 🌐 **Universal Compatibility** | Works with **any user** - from `www-data` to `root`! |
+
+---
+
+## 🌐 Inclusive Design - Works for ALL Users!
+
+**Linspector is designed to work seamlessly with any Linux user account** - whether you're running as:
+- 👤 Regular unprivileged users
+- 🌐 Service accounts (`www-data`, `nobody`, `daemon`)
+- 🔧 Application users (`nginx`, `mysql`, `postgres`)
+- 👑 Root user (full system access)
+
+### Automatic Privilege Detection
+The tool automatically detects your privilege level and:
+- ✅ Shows what you **CAN** access
+- ℹ️ Informs you what requires elevated privileges (no crashes!)
+- 📊 Provides valuable enumeration data regardless of privilege level
+- 🛡️ Handles permissions gracefully without errors
+
+See [INCLUSIVE_USAGE.md](INCLUSIVE_USAGE.md) for detailed examples and best practices.
 
 ---
 
@@ -97,6 +117,37 @@ OPTIONS:
 
 # Silent audit with version inventory (for scheduled tasks)
 ./Linspector.sh -q -i -r /var/log/security_audit
+
+# Fast scan for unprivileged users
+./Linspector.sh -f -r my_scan
+
+# Run as specific user (e.g., www-data for web app auditing)
+sudo -u www-data ./Linspector.sh -f -r /tmp/www-data-scan
+
+# Root-level comprehensive audit
+sudo ./Linspector.sh -t -i -r /root/complete_audit
+```
+
+### Example Output for Different Privilege Levels
+
+**As Root:**
+```
+[+] Privilege level: ROOT (full access)
+[+] We can read the shadow file!
+```
+
+**As Regular User:**
+```
+[+] Privilege level: CAN SUDO (elevated access available)
+[i] Cannot read /etc/shadow (requires root privileges)
+```
+
+**As Service Account (www-data):**
+```
+[+] Privilege level: UNPRIVILEGED (limited access - some checks will be skipped)
+[i] Cannot read /etc/shadow (requires root privileges)
+[i] Cannot read /etc/sudoers (requires root privileges)
+```
 
 # Search for passwords in configs
 ./Linspector.sh -k password -r credential_check

@@ -23,6 +23,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.sublime-*
-
-# Original LinEnum (if kept for reference)
-LinEnum.sh
+-23*
+test_*
+INCLUSIVE*

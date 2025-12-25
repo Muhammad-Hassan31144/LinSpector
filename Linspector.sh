@@ -49,8 +49,64 @@ LOW_PRIORITY=1
 # Max results for find operations to prevent memory bloat
 MAX_FIND_RESULTS=500
 # Temporary file for streaming large outputs (auto-cleaned)
-TEMP_DIR="${TMPDIR:-/tmp}"
+# Use user-specific temp directory to ensure write permissions
+if [ -n "$XDG_RUNTIME_DIR" ] && [ -w "$XDG_RUNTIME_DIR" ]; then
+    TEMP_DIR="$XDG_RUNTIME_DIR"
+elif [ -w "/tmp" ]; then
+    TEMP_DIR="/tmp"
+elif [ -w "$HOME" ]; then
+    TEMP_DIR="$HOME/.cache"
+    mkdir -p "$TEMP_DIR" 2>/dev/null
+else
+    TEMP_DIR="${TMPDIR:-/tmp}"
+fi
 TEMP_FILE=""
+
+#=============================================================================
+# PRIVILEGE DETECTION
+#=============================================================================
+# Global variable to track user privilege level
+IS_ROOT=0
+CAN_SUDO=0
+CURRENT_USER=$(whoami 2>/dev/null || echo "unknown")
+CURRENT_UID=$(id -u 2>/dev/null || echo "999")
+
+# Detect user privilege level
+detect_privileges() {
+    # Check if running as root
+    if [ "$CURRENT_UID" = "0" ] || [ "$CURRENT_USER" = "root" ]; then
+        IS_ROOT=1
+        CAN_SUDO=1
+        return
+    fi
+    
+    # Check if user can sudo without password
+    if sudo -n true 2>/dev/null; then
+        CAN_SUDO=1
+    fi
+}
+
+# Check if file/directory is readable
+can_read() {
+    [ -r "$1" ] 2>/dev/null
+}
+
+# Execute command only if we have privileges, otherwise show informative message
+priv_exec() {
+    local cmd="$1"
+    local label="$2"
+    
+    # Try to execute the command
+    if eval "$cmd" 2>/dev/null; then
+        return 0
+    else
+        # Command failed, likely due to permissions
+        if [ "$QUIET_MODE" != "1" ]; then
+            echo -e "\e[00;90m[i] ${label}: Insufficient permissions (run as root for full access)\e[00m"
+        fi
+        return 1
+    fi
+}
 
 #=============================================================================
 # CLEANUP HANDLER
@@ -129,8 +185,11 @@ get_kernel_version() {
 # Get sudo version
 get_sudo_version() {
     local ver
-    ver=$(sudo -V 2>/dev/null | grep "Sudo version" | awk '{print $3}')
-    store_version "Sudo" "$ver" "sudo -V"
+    # Try without invoking sudo first
+    if command -v sudo >/dev/null 2>&1; then
+        ver=$(sudo -V 2>/dev/null | grep "Sudo version" | awk '{print $3}')
+        [ -n "$ver" ] && store_version "Sudo" "$ver" "sudo -V"
+    fi
     echo "$ver"
 }
 
@@ -139,27 +198,35 @@ get_ssh_version() {
     local ver
     ver=$(ssh -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+[a-z]*' | sed 's/OpenSSH_//')
     store_version "OpenSSH Client" "$ver" "ssh -V"
-    # Also check sshd
-    local sshd_ver
-    sshd_ver=$(sshd -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+[a-z]*' | sed 's/OpenSSH_//' | head -1)
-    [ -n "$sshd_ver" ] && store_version "OpenSSH Server" "$sshd_ver" "sshd -V"
+    # Also check sshd (may require root)
+    if command -v sshd >/dev/null 2>&1; then
+        local sshd_ver
+        sshd_ver=$(sshd -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+[a-z]*' | sed 's/OpenSSH_//' | head -1)
+        [ -n "$sshd_ver" ] && store_version "OpenSSH Server" "$sshd_ver" "sshd -V"
+    fi
     echo "$ver"
 }
 
 # Get Apache version
 get_apache_version() {
     local ver
-    ver=$(apache2 -v 2>/dev/null | grep "Server version" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-    [ -z "$ver" ] && ver=$(httpd -v 2>/dev/null | grep "Server version" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-    [ -n "$ver" ] && store_version "Apache" "$ver" "apache2 -v"
+    if command -v apache2 >/dev/null 2>&1; then
+        ver=$(apache2 -v 2>/dev/null | grep "Server version" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+    fi
+    if [ -z "$ver" ] && command -v httpd >/dev/null 2>&1; then
+        ver=$(httpd -v 2>/dev/null | grep "Server version" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+    fi
+    [ -n "$ver" ] && store_version "Apache" "$ver" "apache2/httpd -v"
     echo "$ver"
 }
 
 # Get Nginx version
 get_nginx_version() {
     local ver
-    ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-    [ -n "$ver" ] && store_version "Nginx" "$ver" "nginx -v"
+    if command -v nginx >/dev/null 2>&1; then
+        ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+        [ -n "$ver" ] && store_version "Nginx" "$ver" "nginx -v"
+    fi
     echo "$ver"
 }
 
@@ -462,6 +529,14 @@ debug_info() {
     fi
     
     echo "[+] Resource optimization: Enabled (delays: ${SECTION_DELAY}s/${FIND_DELAY}s)"
+    echo "[+] Running as user: $CURRENT_USER (UID: $CURRENT_UID)"
+    if [ "$IS_ROOT" = "1" ]; then
+        echo -e "\e[00;32m[+] Privilege level: ROOT (full access)\e[00m"
+    elif [ "$CAN_SUDO" = "1" ]; then
+        echo -e "\e[00;33m[+] Privilege level: CAN SUDO (elevated access available)\e[00m"
+    else
+        echo -e "\e[00;90m[+] Privilege level: UNPRIVILEGED (limited access - some checks will be skipped)\e[00m"
+    fi
     
     sleep 1
     
@@ -528,9 +603,12 @@ user_info() {
     exec_print "\e[00;31m[-] Contents of /etc/passwd:\e[00m" cat /etc/passwd
     
     # Shadow file check
-    if cat /etc/shadow >/dev/null 2>&1; then
+    if can_read /etc/shadow; then
         echo -e "\e[00;33m[+] We can read the shadow file!\e[00m"
         cat /etc/shadow 2>/dev/null
+        echo ""
+    elif [ "$QUIET_MODE" != "1" ]; then
+        echo -e "\e[00;90m[i] Cannot read /etc/shadow (requires root privileges)\e[00m"
         echo ""
     fi
     
@@ -538,15 +616,22 @@ user_info() {
     exec_print "\e[00;31m[-] Super user account(s):\e[00m" sh -c "grep -v -E '^#' /etc/passwd 2>/dev/null | awk -F: '\$3 == 0 { print \$1}'"
     
     # Sudoers
-    exec_print "\e[00;31m[-] Sudoers configuration (condensed):\e[00m" sh -c "grep -v -e '^$' /etc/sudoers 2>/dev/null | grep -v '#'"
+    if can_read /etc/sudoers; then
+        exec_print "\e[00;31m[-] Sudoers configuration (condensed):\e[00m" sh -c "grep -v -e '^$' /etc/sudoers 2>/dev/null | grep -v '#'"
+    elif [ "$QUIET_MODE" != "1" ]; then
+        echo -e "\e[00;90m[i] Cannot read /etc/sudoers (requires root privileges)\e[00m"
+        echo ""
+    fi
     
     # Sudo without password
-    local sudoperms
-    sudoperms=$(echo '' | sudo -S -l -k 2>/dev/null)
-    if [ -n "$sudoperms" ]; then
-        echo -e "\e[00;33m[+] We can sudo without supplying a password!\e[00m"
-        echo "$sudoperms"
-        echo ""
+    if command -v sudo >/dev/null 2>&1; then
+        local sudoperms
+        sudoperms=$(echo '' | sudo -S -l -k 2>/dev/null)
+        if [ -n "$sudoperms" ]; then
+            echo -e "\e[00;33m[+] We can sudo without supplying a password!\e[00m"
+            echo "$sudoperms"
+            echo ""
+        fi
     fi
     
     # SUID sudo binaries
@@ -567,9 +652,12 @@ user_info() {
     exec_print "\e[00;31m[-] Home directory permissions:\e[00m" ls -ahl /home/
     
     # Root home directory
-    if ls -ahl /root/ >/dev/null 2>&1; then
+    if can_read /root/; then
         echo -e "\e[00;33m[+] We can read root's home directory!\e[00m"
         ls -ahl /root/ 2>/dev/null
+        echo ""
+    elif [ "$QUIET_MODE" != "1" ]; then
+        echo -e "\e[00;90m[i] Cannot read /root/ directory (requires root privileges)\e[00m"
         echo ""
     fi
     
@@ -1015,10 +1103,23 @@ if [ "$QUIET_MODE" = "1" ] && [ -z "$report" ]; then
     exit 1
 fi
 
+# Detect user privilege level
+detect_privileges
+
 # Set low priority for entire script if enabled
 if [ "$LOW_PRIORITY" = "1" ]; then
     renice 19 $$ >/dev/null 2>&1
     ionice -c 3 -p $$ >/dev/null 2>&1
+fi
+
+# Ensure report file path is writable
+if [ -n "$report" ]; then
+    # If report path is absolute and not writable, try to use home directory
+    report_dir=$(dirname "$report")
+    if [ ! -w "$report_dir" ] 2>/dev/null; then
+        echo -e "\e[00;33m[!] Warning: Cannot write to $report_dir, using $HOME instead\e[00m" >&2
+        report="$HOME/$(basename "$report")"
+    fi
 fi
 
 # Run the scan
