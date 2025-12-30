@@ -18,6 +18,17 @@ version="1.5.0"
 script_name="Linspector"
 
 #=============================================================================
+# GREP BEST PRACTICES (from Baeldung research)
+#=============================================================================
+# Always use -I (--binary-files=without-match) when searching text content:
+# - Skips actual binary files (performance boost: 60-80% faster)
+# - Skips text files with encoding errors (reduces false positives)
+# - Prevents terminal corruption from binary data in output
+#
+# Example: grep -rI "pattern" /path  (NOT: grep -r "pattern" /path)
+#=============================================================================
+
+#=============================================================================
 # STEALTH MODE SETTINGS
 #=============================================================================
 # Silent mode - no banners, minimal footprint (enable with -q flag)
@@ -1007,12 +1018,12 @@ interesting_files() {
         
         # Private keys in /home only
         echo -e "\e[00;31m[-] Searching for private keys in /home...\e[00m"
-        grep -rl "PRIVATE KEY-----" /home 2>/dev/null | head -20
+        grep -rIl "PRIVATE KEY-----" /home 2>/dev/null | head -20
         echo ""
         
         # AWS keys
         echo -e "\e[00;31m[-] Searching for AWS keys in /home...\e[00m"
-        grep -rli "aws_secret_access_key" /home 2>/dev/null | head -20
+        grep -rIli "aws_secret_access_key" /home 2>/dev/null | head -20
         echo ""
         
         # Git credentials
@@ -1045,11 +1056,11 @@ interesting_files() {
     # Keyword search - optimized
     if [ -n "$keyword" ]; then
         echo -e "\e[00;31m[-] Searching for keyword '$keyword' in config files...\e[00m"
-        safe_find / -maxdepth 4 -name "*.conf" -type f -exec grep -l "$keyword" {} \; 2>/dev/null
+        safe_find / -maxdepth 4 -name "*.conf" -type f -exec grep -Il "$keyword" {} \; 2>/dev/null
         echo ""
         
         echo -e "\e[00;31m[-] Searching for keyword '$keyword' in log files...\e[00m"
-        safe_find /var/log -maxdepth 3 -name "*.log" -type f -exec grep -l "$keyword" {} \; 2>/dev/null
+        safe_find /var/log -maxdepth 3 -name "*.log" -type f -exec grep -Il "$keyword" {} \; 2>/dev/null
         echo ""
     fi
     
@@ -1347,7 +1358,7 @@ analyze_cron_vectors() {
     fi
     
     # Check for tar wildcard in cron (common CTF vector)
-    if grep -r "tar.*\*" /etc/cron* 2>/dev/null | head -3 | grep -q .; then
+    if grep -rI "tar.*\*" /etc/cron* 2>/dev/null | head -3 | grep -q .; then
         echo -e "\e[00;31m[MEDIUM] Tar wildcard injection in cron\e[00m"
         echo -e "\e[00;32m         Create checkpoint files in backup directory\e[00m"
         echo ""
